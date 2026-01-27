@@ -1,6 +1,5 @@
-use crate::{claims::Claims, claims_error::ClaimsError};
+use crate::{claims::Claims, claims_error::ClaimsError, types::JwtHeader};
 use async_trait::async_trait;
-use jsonwebtoken::Header;
 use serde_json::Value;
 
 /// Plugin that knows how to normalize provider-specific claims into standard Claims format
@@ -40,7 +39,7 @@ pub trait KeyProvider: Send + Sync {
     /// - Find the appropriate key (e.g., by kid)
     /// - Validate the signature
     /// - Return raw claims for further processing
-    async fn validate_and_decode(&self, token: &str) -> Result<(Header, Value), ClaimsError>;
+    async fn validate_and_decode(&self, token: &str) -> Result<(JwtHeader, Value), ClaimsError>;
 
     /// Optional: refresh keys if this provider supports it (e.g., JWKS)
     async fn refresh_keys(&self) -> Result<(), ClaimsError> {

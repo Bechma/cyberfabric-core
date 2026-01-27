@@ -1,45 +1,25 @@
-use crate::{claims_error::ClaimsError, plugin_traits::KeyProvider};
-use arc_swap::ArcSwap;
+use crate::{claims_error::ClaimsError, plugin_traits::KeyProvider, types::JwtHeader};
+use aliri::jwt::{BasicHeaders, CoreHeaders, HasAlgorithm};
+use aliri::{Jwks, JwtRef, jwt};
 use async_trait::async_trait;
-use jsonwebtoken::{DecodingKey, Header, Validation, decode, decode_header};
-use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 
-#[derive(Debug, Clone, Deserialize)]
-struct Jwk {
-    kid: String,
-    kty: String,
-    #[serde(rename = "use")]
-    #[allow(dead_code)]
-    use_: Option<String>,
-    n: String,
-    e: String,
-    #[allow(dead_code)]
-    alg: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct JwksResponse {
-    keys: Vec<Jwk>,
-}
-
-/// JWKS-based key provider with lock-free reads
+/// JWKS-based key provider using aliri
 ///
-/// Uses `ArcSwap` for lock-free key lookups and background refresh with exponential backoff.
+/// Provides JWT validation with background key refresh and on-demand refresh for unknown keys.
 #[must_use]
 pub struct JwksKeyProvider {
     /// JWKS endpoint URL
     jwks_uri: String,
 
-    /// Keys stored in `ArcSwap` for lock-free reads
-    keys: Arc<ArcSwap<HashMap<String, DecodingKey>>>,
+    /// Cached JWKS
+    jwks: Arc<RwLock<Option<Jwks>>>,
 
-    /// Last refresh time and error tracking for backoff
+    /// Last refresh time tracking
     refresh_state: Arc<RwLock<RefreshState>>,
 
     /// HTTP client for fetching JWKS
@@ -61,7 +41,6 @@ struct RefreshState {
     last_on_demand_refresh: Option<Instant>,
     consecutive_failures: u32,
     last_error: Option<String>,
-    failed_kids: HashSet<String>,
 }
 
 impl JwksKeyProvider {
@@ -72,7 +51,7 @@ impl JwksKeyProvider {
     pub fn new(jwks_uri: impl Into<String>) -> Result<Self, reqwest::Error> {
         Ok(Self {
             jwks_uri: jwks_uri.into(),
-            keys: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            jwks: Arc::new(RwLock::new(None)),
             refresh_state: Arc::new(RwLock::new(RefreshState::default())),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -84,25 +63,28 @@ impl JwksKeyProvider {
     }
 
     /// Create with custom refresh interval
+    #[must_use]
     pub fn with_refresh_interval(mut self, interval: Duration) -> Self {
         self.refresh_interval = interval;
         self
     }
 
     /// Create with custom max backoff
+    #[must_use]
     pub fn with_max_backoff(mut self, max_backoff: Duration) -> Self {
         self.max_backoff = max_backoff;
         self
     }
 
     /// Create with custom on-demand refresh cooldown
+    #[must_use]
     pub fn with_on_demand_refresh_cooldown(mut self, cooldown: Duration) -> Self {
         self.on_demand_refresh_cooldown = cooldown;
         self
     }
 
     /// Fetch JWKS from the endpoint
-    async fn fetch_jwks(&self) -> Result<HashMap<String, DecodingKey>, ClaimsError> {
+    async fn fetch_jwks(&self) -> Result<Jwks, ClaimsError> {
         let response = self
             .client
             .get(&self.jwks_uri)
@@ -117,27 +99,12 @@ impl JwksKeyProvider {
             )));
         }
 
-        let jwks: JwksResponse = response
+        let jwks: Jwks = response
             .json()
             .await
             .map_err(|e| ClaimsError::JwksFetchFailed(format!("Failed to parse JWKS: {e}")))?;
 
-        let mut keys = HashMap::new();
-        for jwk in jwks.keys {
-            if jwk.kty == "RSA" {
-                let key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
-                    .map_err(|e| ClaimsError::JwksFetchFailed(format!("Invalid RSA key: {e}")))?;
-                keys.insert(jwk.kid, key);
-            }
-        }
-
-        if keys.is_empty() {
-            return Err(ClaimsError::JwksFetchFailed(
-                "No valid RSA keys found in JWKS".into(),
-            ));
-        }
-
-        Ok(keys)
+        Ok(jwks)
     }
 
     /// Calculate backoff duration based on consecutive failures
@@ -169,9 +136,12 @@ impl JwksKeyProvider {
     /// Perform key refresh with error tracking
     async fn perform_refresh(&self) -> Result<(), ClaimsError> {
         match self.fetch_jwks().await {
-            Ok(new_keys) => {
-                // Update keys atomically
-                self.keys.store(Arc::new(new_keys));
+            Ok(new_jwks) => {
+                // Update keys
+                {
+                    let mut jwks_guard = self.jwks.write().await;
+                    *jwks_guard = Some(new_jwks);
+                }
 
                 // Update refresh state
                 let mut state = self.refresh_state.write().await;
@@ -193,12 +163,6 @@ impl JwksKeyProvider {
         }
     }
 
-    /// Check if a key exists in the cache
-    fn key_exists(&self, kid: &str) -> bool {
-        let keys = self.keys.load();
-        keys.contains_key(kid)
-    }
-
     /// Check if we're in cooldown period and handle throttling logic
     async fn check_refresh_throttle(&self, kid: &str) -> Result<(), ClaimsError> {
         let state = self.refresh_state.read().await;
@@ -211,100 +175,132 @@ impl JwksKeyProvider {
                     remaining_secs = remaining.as_secs(),
                     "On-demand JWKS refresh throttled (cooldown active)"
                 );
-
-                // Check if this kid has failed before
-                if state.failed_kids.contains(kid) {
-                    tracing::warn!(
-                        kid = kid,
-                        "Unknown kid repeatedly requested despite recent refresh attempts"
-                    );
-                }
-
                 return Err(ClaimsError::UnknownKeyId(kid.to_owned()));
             }
         }
         Ok(())
     }
 
-    /// Update state after successful refresh and check if kid is now available
-    async fn handle_refresh_success(&self, kid: &str) -> Result<(), ClaimsError> {
-        let mut state = self.refresh_state.write().await;
-        state.last_on_demand_refresh = Some(Instant::now());
-
-        // Check if the kid now exists
-        if self.key_exists(kid) {
-            // Kid found - remove from failed list if present
-            state.failed_kids.remove(kid);
-        } else {
-            // Kid still not found after refresh - track it
-            state.failed_kids.insert(kid.to_owned());
-            tracing::warn!(
-                kid = kid,
-                "Kid still not found after on-demand JWKS refresh"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Update state after failed refresh
-    async fn handle_refresh_failure(&self, kid: &str, error: ClaimsError) -> ClaimsError {
-        let mut state = self.refresh_state.write().await;
-        state.last_on_demand_refresh = Some(Instant::now());
-        state.failed_kids.insert(kid.to_owned());
-        error
-    }
-
     /// Try to refresh keys if unknown kid is encountered
-    /// Implements throttling to prevent excessive refreshes
     async fn on_demand_refresh(&self, kid: &str) -> Result<(), ClaimsError> {
-        // Check if key exists
-        if self.key_exists(kid) {
-            return Ok(());
-        }
-
         // Check if we're in cooldown period
         self.check_refresh_throttle(kid).await?;
 
-        // Attempt refresh and track the kid if it fails
         tracing::info!(
             kid = kid,
             "Performing on-demand JWKS refresh for unknown kid"
         );
 
+        // Attempt refresh
         match self.perform_refresh().await {
-            Ok(()) => self.handle_refresh_success(kid).await,
-            Err(e) => Err(self.handle_refresh_failure(kid, e).await),
+            Ok(()) => {
+                let mut state = self.refresh_state.write().await;
+                state.last_on_demand_refresh = Some(Instant::now());
+                Ok(())
+            }
+            Err(e) => {
+                let mut state = self.refresh_state.write().await;
+                state.last_on_demand_refresh = Some(Instant::now());
+                Err(e)
+            }
         }
     }
 
-    /// Get a key by kid (lock-free read)
-    fn get_key(&self, kid: &str) -> Option<DecodingKey> {
-        let keys = self.keys.load();
-        keys.get(kid).cloned()
-    }
+    /// Validate JWT using aliri and return header + claims
+    async fn validate_jwt_internal(&self, token: &str) -> Result<(JwtHeader, Value), ClaimsError> {
+        // Parse the JWT
+        let jwt = JwtRef::from_str(token);
 
-    /// Validate JWT and decode into header + raw claims
-    fn validate_token(
-        token: &str,
-        key: &DecodingKey,
-        header: &Header,
-    ) -> Result<Value, ClaimsError> {
-        let mut validation = Validation::new(header.alg);
+        // Decompose to get header info using BasicHeaders (which implements CoreHeaders + HasAlgorithm)
+        let decomposed: jwt::Decomposed<'_, BasicHeaders> = jwt
+            .decompose()
+            .map_err(|e| ClaimsError::DecodeFailed(format!("Failed to decompose JWT: {e}")))?;
 
-        // Disable all built-in validations - we'll do them separately
-        validation.validate_exp = false;
-        validation.validate_nbf = false;
-        validation.validate_aud = false;
+        // Extract header info using trait methods
+        let kid = decomposed.kid().map(ToString::to_string);
+        let alg = decomposed.alg();
+        let algorithm_str = format!("{alg:?}");
 
-        // Don't require any standard claims
-        let empty_claims: &[&str] = &[];
-        validation.set_required_spec_claims(empty_claims);
+        // Extract kid for key lookup
+        let kid_str = kid
+            .as_ref()
+            .ok_or_else(|| ClaimsError::DecodeFailed("Missing kid in JWT header".into()))?;
 
-        let token_data = decode::<Value>(token, key, &validation)
-            .map_err(|e| ClaimsError::DecodeFailed(format!("JWT validation failed: {e}")))?;
+        // Get JWKS - if not loaded, trigger refresh
+        {
+            let jwks_guard = self.jwks.read().await;
+            if jwks_guard.is_none() {
+                drop(jwks_guard);
+                self.on_demand_refresh(kid_str).await?;
+            }
+        }
 
-        Ok(token_data.claims)
+        // Try to verify with current keys
+        let verify_result: Result<jwt::Validated<jwt::BasicClaims, BasicHeaders>, ClaimsError> = {
+            let jwks_guard = self.jwks.read().await;
+            let jwks = jwks_guard
+                .as_ref()
+                .ok_or_else(|| ClaimsError::JwksFetchFailed("No JWKS loaded".into()))?;
+
+            // Find the key by ID using the decomposed header's kid
+            let key = jwks
+                .get_key_by_opt(decomposed.kid(), alg)
+                .ok_or_else(|| ClaimsError::UnknownKeyId(kid_str.clone()))?;
+
+            // Create a validator that skips time validation (we do it separately)
+            let validator = jwt::CoreValidator::default()
+                .ignore_expiration()
+                .ignore_not_before()
+                .add_approved_algorithm(alg);
+
+            // Verify the JWT with BasicClaims (which implements CoreClaims)
+            jwt.verify::<jwt::BasicClaims, BasicHeaders, _>(key, &validator)
+                .map_err(|e| ClaimsError::DecodeFailed(format!("JWT validation failed: {e}")))
+        };
+
+        // If key not found, try refresh once
+        let _validated = match verify_result {
+            Ok(v) => v,
+            Err(ClaimsError::UnknownKeyId(_)) => {
+                // Try on-demand refresh
+                self.on_demand_refresh(kid_str).await?;
+
+                // Retry verification
+                let jwks_guard = self.jwks.read().await;
+                let jwks = jwks_guard
+                    .as_ref()
+                    .ok_or_else(|| ClaimsError::JwksFetchFailed("No JWKS loaded".into()))?;
+
+                // Re-decompose to get fresh reference
+                let decomposed: jwt::Decomposed<'_, BasicHeaders> =
+                    jwt.decompose().map_err(|e| {
+                        ClaimsError::DecodeFailed(format!("Failed to decompose JWT: {e}"))
+                    })?;
+
+                let key = jwks
+                    .get_key_by_opt(decomposed.kid(), decomposed.alg())
+                    .ok_or_else(|| ClaimsError::UnknownKeyId(kid_str.clone()))?;
+
+                let validator = jwt::CoreValidator::default()
+                    .ignore_expiration()
+                    .ignore_not_before()
+                    .add_approved_algorithm(alg);
+
+                jwt.verify::<jwt::BasicClaims, BasicHeaders, _>(key, &validator)
+                    .map_err(|e| ClaimsError::DecodeFailed(format!("JWT validation failed: {e}")))?
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Now parse the payload as Value for full claims
+        // The JWT is verified, so we can safely decode the payload
+        let payload = decomposed.untrusted_payload();
+        let claims: Value = serde_json::from_str(payload)
+            .map_err(|e| ClaimsError::DecodeFailed(format!("Failed to parse claims: {e}")))?;
+
+        let jwt_header = JwtHeader::new(algorithm_str, kid);
+
+        Ok((jwt_header, claims))
     }
 }
 
@@ -314,35 +310,10 @@ impl KeyProvider for JwksKeyProvider {
         "jwks"
     }
 
-    async fn validate_and_decode(&self, token: &str) -> Result<(Header, Value), ClaimsError> {
+    async fn validate_and_decode(&self, token: &str) -> Result<(JwtHeader, Value), ClaimsError> {
         // Strip "Bearer " prefix if present
         let token = token.trim_start_matches("Bearer ").trim();
-
-        // Decode header to get kid and algorithm
-        let header = decode_header(token)
-            .map_err(|e| ClaimsError::DecodeFailed(format!("Invalid JWT header: {e}")))?;
-
-        let kid = header
-            .kid
-            .as_ref()
-            .ok_or_else(|| ClaimsError::DecodeFailed("Missing kid in JWT header".into()))?;
-
-        // Try to get key from cache
-        let key = if let Some(k) = self.get_key(kid) {
-            k
-        } else {
-            // Key not in cache, try on-demand refresh
-            self.on_demand_refresh(kid).await?;
-
-            // Try again after refresh
-            self.get_key(kid)
-                .ok_or_else(|| ClaimsError::UnknownKeyId(kid.clone()))?
-        };
-
-        // Validate signature and decode claims
-        let claims = Self::validate_token(token, &key, &header)?;
-
-        Ok((header, claims))
+        self.validate_jwt_internal(token).await
     }
 
     async fn refresh_keys(&self) -> Result<(), ClaimsError> {
@@ -394,47 +365,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_key_storage() -> Result<(), reqwest::Error> {
-        let provider = JwksKeyProvider::new("https://example.com/jwks")?;
-
-        // Initially empty
-        assert!(provider.get_key("test-kid").is_none());
-
-        // Store a dummy key
-        let mut keys = HashMap::new();
-        keys.insert("test-kid".to_owned(), DecodingKey::from_secret(b"secret"));
-        provider.keys.store(Arc::new(keys));
-
-        // Should be retrievable
-        assert!(provider.get_key("test-kid").is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_on_demand_refresh_returns_ok_when_key_exists() -> Result<(), reqwest::Error> {
-        let provider = JwksKeyProvider::new("https://example.com/jwks")?;
-
-        // Pre-populate with a key
-        let mut keys = HashMap::new();
-        keys.insert(
-            "existing-kid".to_owned(),
-            DecodingKey::from_secret(b"secret"),
-        );
-        provider.keys.store(Arc::new(keys));
-
-        // Should return Ok immediately without any refresh
-        let result = provider.on_demand_refresh("existing-kid").await;
-        assert!(result.is_ok());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_on_demand_refresh_returns_error_for_missing_key_on_failed_fetch()
-    -> Result<(), reqwest::Error> {
+    async fn test_on_demand_refresh_returns_error_for_failed_fetch() -> Result<(), reqwest::Error> {
         let provider =
             JwksKeyProvider::new("https://invalid-domain-that-does-not-exist.local/jwks")?;
 
-        // Attempting to refresh a missing key should fail (network error)
+        // Attempting to refresh should fail (network error)
         let result = provider.on_demand_refresh("missing-kid").await;
         assert!(result.is_err());
 
@@ -468,37 +403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_on_demand_refresh_tracks_failed_kids() -> Result<(), reqwest::Error> {
-        let provider = JwksKeyProvider::new("https://invalid-domain.local/jwks")?
-            .with_on_demand_refresh_cooldown(Duration::from_millis(100));
-
-        // Attempt refresh - will fail and track the kid
-        let result = provider.on_demand_refresh("failed-kid").await;
-        assert!(result.is_err());
-
-        // Check that failed_kids contains the kid
-        let state = provider.refresh_state.read().await;
-        assert!(state.failed_kids.contains("failed-kid"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_validate_and_decode_with_missing_kid() -> Result<(), reqwest::Error> {
-        let provider = JwksKeyProvider::new("https://invalid-domain.local/jwks")?
-            .with_on_demand_refresh_cooldown(Duration::from_millis(100));
-
-        // Create a minimal JWT with a kid header but invalid signature
-        let token =
-            "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2lkIn0.eyJzdWIiOiIxMjM0NTY3ODkwIn0.invalid";
-
-        // Should attempt on-demand refresh and fail
-        let result = provider.validate_and_decode(token).await;
-        assert!(result.is_err());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_perform_refresh_updates_state_on_success() -> Result<(), reqwest::Error> {
+    async fn test_perform_refresh_updates_state_on_failure() -> Result<(), reqwest::Error> {
         let provider = JwksKeyProvider::new("https://invalid-domain.local/jwks")?;
 
         // Mark as previously failed
@@ -508,8 +413,9 @@ mod tests {
             state.last_error = Some("Previous error".to_owned());
         }
 
-        // This will fail, but we're testing state update logic
-        let _ = provider.perform_refresh().await;
+        // This will fail
+        let res = provider.perform_refresh().await;
+        assert!(res.is_err());
 
         // Check that consecutive_failures increased
         let state = provider.refresh_state.read().await;

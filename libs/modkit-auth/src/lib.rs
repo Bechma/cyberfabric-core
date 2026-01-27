@@ -29,7 +29,7 @@ pub mod axum_ext;
 pub use claims::Claims;
 pub use errors::AuthError;
 pub use traits::TokenValidator;
-pub use types::{AuthRequirement, RoutePolicy, SecRequirement};
+pub use types::{AuthRequirement, JwtHeader, RoutePolicy, SecRequirement};
 
 // Plugin system exports
 pub use auth_mode::{AuthModeConfig, PluginRegistry};

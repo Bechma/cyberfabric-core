@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use jsonwebtoken::Header;
 use modkit_auth::claims::Permission;
 use modkit_auth::plugin_traits::{ClaimsPlugin, KeyProvider};
+use modkit_auth::types::JwtHeader;
 use modkit_auth::validation::{
     extract_audiences, extract_string, parse_timestamp, parse_uuid_from_value,
 };
@@ -118,8 +118,8 @@ impl KeyProvider for StaticKeyProvider {
         "static"
     }
 
-    async fn validate_and_decode(&self, _token: &str) -> Result<(Header, Value), ClaimsError> {
-        Ok((Header::default(), self.claims.clone()))
+    async fn validate_and_decode(&self, _token: &str) -> Result<(JwtHeader, Value), ClaimsError> {
+        Ok((JwtHeader::default(), self.claims.clone()))
     }
 }
 

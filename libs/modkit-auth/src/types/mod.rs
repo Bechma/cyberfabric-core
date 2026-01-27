@@ -1,3 +1,7 @@
+mod jwt_header;
+
+pub use jwt_header::JwtHeader;
+
 /// Security requirement - defines required resource and action
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecRequirement {

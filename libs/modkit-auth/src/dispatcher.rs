@@ -7,6 +7,7 @@ use crate::{
     errors::AuthError,
     plugin_traits::{ClaimsPlugin, IntrospectionProvider, KeyProvider},
     traits::TokenValidator,
+    types::JwtHeader,
     validation::{ValidationConfig, validate_claims},
 };
 use async_trait::async_trait;
@@ -75,7 +76,7 @@ impl AuthDispatcher {
     async fn try_validate_with_providers(
         &self,
         token: &str,
-    ) -> Result<(jsonwebtoken::Header, serde_json::Value), ClaimsError> {
+    ) -> Result<(JwtHeader, serde_json::Value), ClaimsError> {
         let mut last_error = None;
         let mut result = None;
 
@@ -413,12 +414,12 @@ mod tests {
     /// Mock `KeyProvider` for testing
     struct MockKeyProvider {
         name: String,
-        response: Option<(jsonwebtoken::Header, serde_json::Value)>,
+        response: Option<(JwtHeader, serde_json::Value)>,
         error_msg: Option<String>,
     }
 
     impl MockKeyProvider {
-        fn success(header: jsonwebtoken::Header, claims: serde_json::Value) -> Self {
+        fn success(header: JwtHeader, claims: serde_json::Value) -> Self {
             Self {
                 name: "mock-key-provider".to_owned(),
                 response: Some((header, claims)),
@@ -444,7 +445,7 @@ mod tests {
         async fn validate_and_decode(
             &self,
             _token: &str,
-        ) -> Result<(jsonwebtoken::Header, serde_json::Value), ClaimsError> {
+        ) -> Result<(JwtHeader, serde_json::Value), ClaimsError> {
             if let Some(msg) = &self.error_msg {
                 Err(ClaimsError::Provider(msg.clone()))
             } else {
@@ -565,7 +566,7 @@ mod tests {
             "exp": claims.expires_at.unwrap().unix_timestamp()
         });
 
-        let header = jsonwebtoken::Header::default();
+        let header = JwtHeader::default();
         let key_provider = Arc::new(MockKeyProvider::success(header.clone(), raw_claims));
         let plugin = Arc::new(MockClaimsPlugin::success(claims.clone()));
 
@@ -630,7 +631,7 @@ mod tests {
 
         let failing_provider =
             Arc::new(MockKeyProvider::failure("First provider failed".to_owned()));
-        let header = jsonwebtoken::Header::default();
+        let header = JwtHeader::default();
         let success_provider = Arc::new(MockKeyProvider::success(header, raw_claims));
         let plugin = Arc::new(MockClaimsPlugin::success(claims.clone()));
 
@@ -665,7 +666,7 @@ mod tests {
             "sub": "user-123"
         });
 
-        let header = jsonwebtoken::Header::default();
+        let header = JwtHeader::default();
         let key_provider = Arc::new(MockKeyProvider::success(header, raw_claims));
         let plugin = Arc::new(MockClaimsPlugin::success(test_claims()));
 
@@ -694,7 +695,7 @@ mod tests {
             "sub": "user-123"
         });
 
-        let header = jsonwebtoken::Header::default();
+        let header = JwtHeader::default();
         let key_provider = Arc::new(MockKeyProvider::success(header, raw_claims));
         let plugin = Arc::new(MockClaimsPlugin::failure("Normalization failed".to_owned()));
 
@@ -728,7 +729,7 @@ mod tests {
             "exp": claims.expires_at.unwrap().unix_timestamp()
         });
 
-        let header = jsonwebtoken::Header::default();
+        let header = JwtHeader::default();
         let key_provider = Arc::new(MockKeyProvider::success(header, raw_claims));
         let plugin = Arc::new(MockClaimsPlugin::success(claims));
 
